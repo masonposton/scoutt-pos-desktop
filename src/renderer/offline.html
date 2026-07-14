@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Scoutt Pro POS — Reconnecting</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 1.25rem; background: #111214; color: #f4f2ee;
+    font-family: -apple-system, "Segoe UI", system-ui, sans-serif; text-align: center; padding: 2rem;
+  }
+  .mark { width: 64px; height: 64px; border-radius: 16px; background: #E07B4B;
+          display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 28px; color: #fff; }
+  h1 { font-size: 1.5rem; margin: 0; font-weight: 700; }
+  p { margin: 0; color: #b9b4ac; max-width: 34ch; line-height: 1.5; }
+  .spinner { width: 22px; height: 22px; border: 3px solid #3a3a3e; border-top-color: #E07B4B;
+             border-radius: 50%; animation: spin 0.9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+  button { margin-top: 0.5rem; background: #E07B4B; color: #fff; border: 0; border-radius: 10px;
+           padding: 0.7rem 1.4rem; font-size: 1rem; font-weight: 600; cursor: pointer; }
+  button:hover { opacity: 0.92; }
+</style>
+</head>
+<body>
+  <div class="mark">S</div>
+  <h1>Reconnecting…</h1>
+  <p>The register can't reach Scoutt Pro right now. It will reconnect automatically as soon as the
+     connection is back — sales made offline are still saved and will sync.</p>
+  <div class="spinner" aria-hidden="true"></div>
+  <button onclick="location.reload()">Retry now</button>
+</body>
+</html>

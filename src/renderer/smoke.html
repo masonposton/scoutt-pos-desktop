@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8" /><title>Scoutt POS — Smoke Test</title>
+<style>body{font-family:system-ui,sans-serif;padding:24px;background:#111;color:#eee}
+h1{font-size:18px}pre{white-space:pre-wrap;font-size:13px;line-height:1.6}
+.pass{color:#6ee7a8}.fail{color:#ff8a8a}</style>
+</head>
+<body>
+<h1>Scoutt Pro POS — shell smoke test</h1>
+<pre id="out">running…</pre>
+<script>
+(async () => {
+  const results = [];
+  const N = window.scouttPOSNative;
+  const rec = (name, ok, detail) => results.push({ name, ok: !!ok, detail: String(detail ?? '') });
+
+  rec('bridge injected', !!N, N ? `v${N.version} ${N.platform}` : 'window.scouttPOSNative MISSING');
+
+  if (N) {
+    try { const s = await N.getStatus(); rec('getStatus', s && s.ok !== false, JSON.stringify(s)); }
+    catch (e) { rec('getStatus', false, e); }
+
+    try { const p = await N.listPrinters(); rec('listPrinters', Array.isArray(p), `${(p || []).length} printer(s)`); }
+    catch (e) { rec('listPrinters', false, e); }
+
+    const receipt = `
+      <div style="width:80mm;font-family:monospace;font-size:12px">
+        <h2 style="text-align:center;margin:4px 0">THE MARION MARKET</h2>
+        <div style="text-align:center">Antique Mall — Register Test</div>
+        <hr>
+        <div>1x SCOUTT LOOP TEST — Pyrex Bowl</div>
+        <div style="text-align:right">$9.00</div>
+        <hr>
+        <div>SUBTOTAL&nbsp;&nbsp;$9.00</div>
+        <div>TOTAL&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$9.00</div>
+        <div>CASH&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;$10.00</div>
+        <div>CHANGE&nbsp;&nbsp;&nbsp;$1.00</div>
+        <p style="text-align:center">Thank you!</p>
+      </div>`;
+    try { const r = await N.printReceipt({ html: receipt }); rec('printReceipt (→PDF in smoke)', r && r.ok, JSON.stringify(r)); }
+    catch (e) { rec('printReceipt', false, e); }
+
+    try { const d = await N.openCashDrawer(); rec('openCashDrawer (→PDF in smoke)', d && d.ok, JSON.stringify(d)); }
+    catch (e) { rec('openCashDrawer', false, e); }
+  }
+
+  const out = document.getElementById('out');
+  out.innerHTML = results.map((r) =>
+    `<span class="${r.ok ? 'pass' : 'fail'}">${r.ok ? 'PASS' : 'FAIL'}</span>  ${r.name} — ${r.detail}`).join('\n');
+
+  if (N && N.__smokeReport) { try { await N.__smokeReport(results); } catch (e) { /* main will time out */ } }
+})();
+</script>
+</body>
+</html>

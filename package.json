@@ -1,0 +1,49 @@
+{
+  "name": "scoutt-pos-desktop",
+  "productName": "Scoutt Pro POS",
+  "version": "0.1.0",
+  "description": "Scoutt Pro POS — Windows kiosk desktop shell for scouttpos.com with native receipt printing, cash-drawer kick, and auto-update.",
+  "main": "src/main/main.js",
+  "author": "Scoutt",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "smoke": "electron . --smoke",
+    "build:win": "electron-builder --win --publish never",
+    "release:win": "electron-builder --win --publish always"
+  },
+  "build": {
+    "appId": "com.scoutt.pos",
+    "productName": "Scoutt Pro POS",
+    "artifactName": "${productName}-Setup-${version}.${ext}",
+    "directories": { "output": "dist" },
+    "win": {
+      "target": ["nsis"]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Scoutt Pro POS",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false,
+      "differentialPackage": true
+    },
+    "publish": [
+      { "provider": "github", "owner": "masonposton", "repo": "scoutt-pos-desktop" }
+    ]
+  },
+  "devDependencies": {
+    "electron": "^43.1.0",
+    "electron-builder": "^26.15.3"
+  },
+  "dependencies": {
+    "electron-log": "^5.4.4",
+    "electron-updater": "^6.8.9"
+  }
+}

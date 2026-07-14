@@ -1,0 +1,7 @@
+node_modules/
+dist/
+out/
+*.log
+.DS_Store
+# Local per-counter config lives in the OS userData dir, never committed
+config.local.json
