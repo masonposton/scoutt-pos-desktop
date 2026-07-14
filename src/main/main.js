@@ -7,15 +7,16 @@
 // splash, and shell auto-update. The APP stays server-hosted (auto-updated on reload);
 // this shell only adds the native + reliability layer.
 //
-// SECURITY (loading REMOTE content into a shell that exposes native power) — per the
-// Electron security docs:
+// SECURITY (loading REMOTE content into a shell that exposes native power):
 //   - contextIsolation + sandbox + nodeIntegration:false, set EXPLICITLY
 //   - the preload exposes ONLY a tiny versioned bridge (never ipcRenderer/invoke)
-//   - navigation + new windows are FENCED to the app origin
+//   - navigation FENCED to the app origin; the app's OWN about:blank print popups are
+//     allowed (locked down); off-origin links only open externally when configured
 //   - every native IPC handler re-verifies the sender frame's origin (print.js)
 
-const { app, BrowserWindow, ipcMain, session, shell, globalShortcut, powerSaveBlocker, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, session, shell, globalShortcut, powerSaveBlocker, Menu, net } = require('electron');
 const path = require('path');
+const fs = require('fs');
 const log = require('electron-log');
 const { autoUpdater } = require('electron-updater');
 const { loadConfig } = require('./config');
@@ -30,7 +31,9 @@ let config = null;
 let appOrigin = null;
 let offlineFallbackActive = false;
 let offlineRetryTimer = null;
-const crashTimes = []; // timestamps of recent renderer crashes (reload-storm guard)
+let unresponsiveTimer = null;
+let updateReady = false;
+const crashTimes = []; // in-memory renderer-crash timestamps (fast reload-storm guard)
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -91,8 +94,6 @@ function createWindow() {
       sandbox: true,
       webSecurity: true,
       spellcheck: false,
-      // Pass the trusted origin (+ smoke flag) into the sandboxed preload's argv so it
-      // only activates the native bridge for our own pages.
       additionalArguments: [`--scoutt-origin=${appOrigin}`, ...(SMOKE ? ['--scoutt-smoke'] : [])],
     },
   });
@@ -100,58 +101,70 @@ function createWindow() {
 
   const wc = mainWindow.webContents;
 
-  // Keep the window pinned to the app origin — cover BOTH navigations and redirects.
-  // External http(s) links (a vendor social link, an email) open in the real browser.
+  // Navigation lock (both navigations and redirects). External http(s) links only leave
+  // the kiosk when openExternalLinks is on (off by default on a locked counter).
   const guardNav = (e, url) => {
-    if (!isAppOrigin(url) && !(SMOKE && /^(file|data):/i.test(url))) {
-      e.preventDefault();
-      if (/^https?:/i.test(url)) shell.openExternal(url).catch(() => {});
-    }
+    if (isAppOrigin(url) || (SMOKE && /^(file|data):/i.test(url))) return;
+    e.preventDefault();
+    if (/^https?:/i.test(url) && config.openExternalLinks) shell.openExternal(url).catch(() => {});
   };
   wc.on('will-navigate', guardNav);
   wc.on('will-redirect', guardNav);
   wc.setWindowOpenHandler(({ url }) => {
-    if (/^https?:/i.test(url) && !isAppOrigin(url)) shell.openExternal(url).catch(() => {});
+    // The web app's print path opens a blank popup (window.open('','_blank')) for reports,
+    // labels, close-out, and as the native-print fallback — allow it, locked down. Deny
+    // everything else; off-origin links optionally open in the real browser.
+    if (url === 'about:blank' || url === '') {
+      return { action: 'allow', overrideBrowserWindowOptions: { webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false } } };
+    }
+    if (/^https?:/i.test(url) && !isAppOrigin(url) && config.openExternalLinks) shell.openExternal(url).catch(() => {});
     return { action: 'deny' };
   });
 
-  // Kiosk key lockdown: cashiers can't reload/close/devtools their way out. Staff use
-  // the deliberate global chords below. Disabled in dev/smoke for debugging.
-  if (config.kiosk && !SMOKE) {
-    wc.on('before-input-event', (event, input) => {
-      const k = (input.key || '').toLowerCase();
-      const block =
-        k === 'f12' ||
-        (input.control && input.shift && (k === 'i' || k === 'c' || k === 'j')) || // devtools
-        (input.control && k === 'r') || // reload
-        (input.control && k === 'w') || // close tab
-        (input.control && k === 'p');   // browser print dialog (we print natively)
-      if (block) event.preventDefault();
-    });
-  }
-
-  // Crash / hang recovery — never leave the counter on a dead screen. Guard against a
-  // reload storm: after 3 crashes in 60s, do a clean full relaunch instead of spinning.
+  // Crash recovery — never leave the counter on a dead screen. Fast in-memory guard (3
+  // crashes/60s → relaunch) PLUS a persisted backoff so a deterministic crash can't spin
+  // an infinite relaunch loop (state survives the relaunch).
   wc.on('render-process-gone', (_e, details) => {
     log.error('render-process-gone', details);
     const now = Date.now();
     crashTimes.push(now);
     while (crashTimes.length && now - crashTimes[0] > 60000) crashTimes.shift();
-    if (crashTimes.length >= 3) { log.error('crash storm → relaunch'); app.relaunch(); app.exit(0); return; }
-    safeReload();
+    if (crashTimes.length >= 3) {
+      if (recentRelaunches().length >= 2) { log.error('relaunch storm → fatal page'); showFatalPage(); return; }
+      recordRelaunch();
+      log.error('crash storm → clean relaunch');
+      app.relaunch();
+      app.exit(0);
+      return;
+    }
+    loadApp(); // re-drive the correct URL (not reload of whatever happened to be showing)
   });
-  wc.on('unresponsive', () => { log.warn('window unresponsive'); });
-  wc.on('responsive', () => log.info('window responsive again'));
+  // Hang recovery — a wedged renderer gets a grace period, then a forced crash that funnels
+  // into the crash-recovery path above (README promises crash/HANG auto-recovery).
+  wc.on('unresponsive', () => {
+    log.warn('window unresponsive');
+    if (unresponsiveTimer) return;
+    unresponsiveTimer = setTimeout(() => {
+      unresponsiveTimer = null;
+      log.error('still unresponsive → forcing renderer crash for recovery');
+      try { wc.forcefullyCrashRenderer(); } catch (e) { log.error(e); }
+    }, 20000);
+  });
+  wc.on('responsive', () => {
+    if (unresponsiveTimer) { clearTimeout(unresponsiveTimer); unresponsiveTimer = null; }
+    log.info('window responsive again');
+  });
 
-  // Offline: swap to a bundled local splash and keep retrying the real URL.
+  // Offline: swap to a bundled local splash; a self-healing poll (HEAD to the app URL, so
+  // no false positives from a captive LAN) reloads the app the moment it's reachable.
   wc.on('did-fail-load', (_e, errorCode, errorDesc, validatedURL, isMainFrame) => {
-    if (errorCode === -3) return; // ERR_ABORTED (superseded navigation)
+    if (errorCode === -3) return; // ERR_ABORTED (superseded navigation) — the poll owns retry
     if (isMainFrame && !SMOKE) { log.warn('did-fail-load', { errorCode, errorDesc, validatedURL }); showOfflineSplash(); }
   });
   wc.on('did-finish-load', () => {
     if (isAppOrigin(wc.getURL())) {
       offlineFallbackActive = false;
-      if (offlineRetryTimer) { clearTimeout(offlineRetryTimer); offlineRetryTimer = null; }
+      if (offlineRetryTimer) { clearInterval(offlineRetryTimer); offlineRetryTimer = null; }
     }
   });
 
@@ -168,31 +181,65 @@ function loadApp() {
 function showOfflineSplash() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   offlineFallbackActive = true;
+  // Always (re)show the splash — covers a failed retry that would otherwise leave a raw
+  // Chromium error page on screen.
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'offline.html')).catch(() => {});
-  if (offlineRetryTimer) clearTimeout(offlineRetryTimer);
-  offlineRetryTimer = setTimeout(() => { if (offlineFallbackActive) loadApp(); }, 5000);
+  if (!offlineRetryTimer) offlineRetryTimer = setInterval(pollReconnect, 5000);
 }
 
-function safeReload() {
-  try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.reloadIgnoringCache(); }
-  catch (e) { log.error('safeReload', e); }
+function pollReconnect() {
+  if (!offlineFallbackActive || !mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    const req = net.request({ method: 'HEAD', url: config.appUrl });
+    req.on('response', () => { if (offlineFallbackActive) loadApp(); }); // reachable (any status) → load
+    req.on('error', () => { /* still offline; try again next tick */ });
+    req.end();
+  } catch { /* net not ready — next tick */ }
+}
+
+function showFatalPage() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const html = `<!doctype html><meta charset="utf-8"><body style="font-family:system-ui,sans-serif;background:#111214;color:#f4f2ee;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;padding:2rem">
+    <h1 style="font-size:1.4rem">Register needs attention</h1>
+    <p style="color:#b9b4ac;max-width:34ch;line-height:1.5">The app kept restarting. Press <b>Ctrl+Shift+R</b> to try again, or <b>Ctrl+Shift+Q</b> to exit and relaunch it.</p></body>`;
+  mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html)).catch(() => {});
+}
+
+// --- persisted relaunch backoff (survives app.relaunch) --------------------------
+function relaunchLogPath() { return path.join(app.getPath('userData'), 'relaunch-log.json'); }
+function recentRelaunches() {
+  try {
+    const arr = JSON.parse(fs.readFileSync(relaunchLogPath(), 'utf8'));
+    const now = Date.now();
+    return (Array.isArray(arr) ? arr : []).filter((t) => now - t < 5 * 60 * 1000);
+  } catch { return []; }
+}
+function recordRelaunch() {
+  try { const arr = recentRelaunches(); arr.push(Date.now()); fs.writeFileSync(relaunchLogPath(), JSON.stringify(arr)); } catch { /* ignore */ }
 }
 
 function registerKioskShortcuts() {
   if (!config.allowExit) return;
-  globalShortcut.register('CommandOrControl+Shift+Q', () => { log.info('staff kiosk exit'); app.quit(); });
-  globalShortcut.register('CommandOrControl+Shift+R', () => safeReload());
+  globalShortcut.register('CommandOrControl+Shift+Q', () => {
+    // If a shell update is staged, install it now (a controlled moment — not OS shutdown).
+    if (updateReady) { log.info('staff exit → quitAndInstall'); try { autoUpdater.quitAndInstall(false, false); return; } catch (e) { log.error(e); } }
+    log.info('staff kiosk exit');
+    app.quit();
+  });
+  globalShortcut.register('CommandOrControl+Shift+R', () => loadApp());
 }
 
 function setupAutoUpdate() {
-  if (!config.autoUpdate || !app.isPackaged) return; // updater no-ops in dev anyway
+  if (!config.autoUpdate || !app.isPackaged) return; // off by default until signed + repo exists
   autoUpdater.logger = log;
   autoUpdater.autoDownload = true;
-  // Install on the next natural quit (end of day), never mid-transaction.
-  autoUpdater.autoInstallOnAppQuit = true;
+  // Do NOT auto-install on ambient quit: on a kiosk that means during Windows shutdown,
+  // which can brick the app mid-write (electron-builder #7807/#3798). Install only at the
+  // controlled staff-exit chord (above).
+  autoUpdater.autoInstallOnAppQuit = false;
   autoUpdater.on('error', (e) => log.warn('autoUpdater error', e));
   autoUpdater.on('update-available', (i) => log.info('update available', i?.version));
-  autoUpdater.on('update-downloaded', (i) => log.info('update downloaded, installs on quit', i?.version));
+  autoUpdater.on('update-downloaded', (i) => { updateReady = true; log.info('update downloaded, installs at next staff exit', i?.version); });
   autoUpdater.checkForUpdatesAndNotify().catch((e) => log.warn('update check failed', e));
   setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), 60 * 60 * 1000);
 }

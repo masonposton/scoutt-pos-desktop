@@ -6,19 +6,23 @@
 // against this exact model) is SILENT print through the installed Star Windows driver.
 // The cash drawer kicks via the driver setting (Peripheral Unit Type = Cash Drawer,
 // already live in prod) — so printing a receipt IS the drawer kick; there is no
-// separate drawer command on this hardware. A "no-sale" drawer pop therefore prints a
-// minimal job to trigger the driver.
+// separate drawer command on this hardware. A "no-sale" drawer pop prints a minimal job.
 //
 // The web app sends its receipt HTML (payload.html). The shell force-blacks it (thermal
-// heads print the app's warm-grey design tokens faint) and prints it in a hidden window.
-// In smoke mode every "print" goes to printToPDF instead, so the whole render pipeline
-// is provable headlessly on a Mac with no physical printer.
+// heads print the app's warm-grey tokens faint) and prints it in a hidden window. In
+// smoke mode every "print" goes to printToPDF instead, so the render pipeline is
+// provable headlessly on a Mac with no physical printer.
 
 const { BrowserWindow } = require('electron');
 
 const STAR_RE = /star|tsp100|tsp143|tsp650|futureprnt/i;
-const RECEIPT_PX_WIDTH = 380; // ~80mm layout width; print size is set via @page/pageSize
+// Chromium's print pipeline lays out at 96 CSS px/inch. So an 80mm-wide receipt is
+// 80/25.4*96 ≈ 302 CSS px wide, and 1 CSS px = 25400/96 ≈ 264.6 microns. (The earlier
+// 380px = 80mm assumption made the declared page height ~20% short → clipped tails.)
+const RECEIPT_PX_WIDTH = Math.round((80 / 25.4) * 96); // ≈ 302
+const MICRONS_PER_PX = 25400 / 96; // ≈ 264.58 µm/px
 const MICRONS_80MM = 80000;
+const PRINT_TIMEOUT_MS = 30000;
 
 // Force TRUE black + an 80mm no-margin page. Design-token greys print faint on thermal.
 const PRINT_CSS = `
@@ -29,12 +33,14 @@ const PRINT_CSS = `
 `;
 
 function wrapReceipt(html) {
-  const style = `<style>${PRINT_CSS}</style>`;
+  // A receipt never needs script; CSP blocks a compromised "receipt" from running JS in
+  // this window. executeJavaScript (height measurement) bypasses page CSP, so it still works.
+  const head = `<meta http-equiv="Content-Security-Policy" content="script-src 'none'; object-src 'none'"><style>${PRINT_CSS}</style>`;
   if (/<html[\s>]/i.test(html)) {
-    if (/<head[\s>]/i.test(html)) return html.replace(/<head([^>]*)>/i, `<head$1>${style}`);
-    return html.replace(/<html([^>]*)>/i, `<html$1><head>${style}</head>`);
+    if (/<head[\s>]/i.test(html)) return html.replace(/<head([^>]*)>/i, `<head$1>${head}`);
+    return html.replace(/<html([^>]*)>/i, `<html$1><head>${head}</head>`);
   }
-  return `<!doctype html><html><head><meta charset="utf-8">${style}</head><body>${html}</body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8">${head}</head><body>${html}</body></html>`;
 }
 
 async function renderReceiptWindow(html) {
@@ -44,9 +50,18 @@ async function renderReceiptWindow(html) {
     height: 800,
     webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false },
   });
-  await win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(wrapReceipt(html)));
-  // Let the compositor paint before we print / printToPDF — calling immediately after
-  // load resolves can fail ("Printing failed") on an offscreen window.
+  // This window renders remote-app-authored HTML — fence it like the main window so a
+  // compromised "receipt" can't spawn a visible window over the kiosk or navigate away.
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  win.webContents.on('will-navigate', (e) => e.preventDefault());
+  try {
+    await win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(wrapReceipt(html)));
+  } catch (e) {
+    if (!win.isDestroyed()) win.destroy(); // don't leak the window if the load rejects
+    throw e;
+  }
+  // Let the compositor paint before printing — calling immediately can fail on an
+  // offscreen window ("Printing failed").
   await new Promise((r) => setTimeout(r, 200));
   return win;
 }
@@ -62,6 +77,7 @@ function registerPrintHandlers(ipcMain, getMainWindow, config, log, opts = {}) {
   };
 
   let resolvedPrinter = config.printerName || null;
+  let resolvedFromFallback = false; // true = we settled on the OS default, not a Star/config match
 
   async function listPrinters() {
     const wc = getMainWindow()?.webContents;
@@ -72,13 +88,17 @@ function registerPrintHandlers(ipcMain, getMainWindow, config, log, opts = {}) {
     } catch (e) { log.warn('getPrintersAsync failed', e); return []; }
   }
 
+  // Re-resolve until we get a SOLID match (config or a Star). A default-printer fallback
+  // (e.g. "Microsoft Print to PDF" when the Star hadn't enumerated yet at startup) is NOT
+  // cached permanently — otherwise every receipt all day silently routes to the wrong device.
   async function resolveStarPrinter() {
-    if (resolvedPrinter) return resolvedPrinter;
+    if (resolvedPrinter && !resolvedFromFallback) return resolvedPrinter;
     const printers = await listPrinters();
     const star = printers.find((p) => STAR_RE.test(p.name || '') || STAR_RE.test(p.displayName || ''));
-    const def = printers.find((p) => p.isDefault);
-    resolvedPrinter = star?.name || def?.name || '';
-    log.info('resolved printer', { resolvedPrinter, star: star?.name, default: def?.name, count: printers.length });
+    if (config.printerName) { resolvedPrinter = config.printerName; resolvedFromFallback = false; }
+    else if (star) { resolvedPrinter = star.name; resolvedFromFallback = false; }
+    else { resolvedPrinter = printers.find((p) => p.isDefault)?.name || ''; resolvedFromFallback = true; }
+    log.info('resolved printer', { resolvedPrinter, resolvedFromFallback, count: printers.length });
     return resolvedPrinter;
   }
 
@@ -86,17 +106,19 @@ function registerPrintHandlers(ipcMain, getMainWindow, config, log, opts = {}) {
     let win;
     try {
       win = await renderReceiptWindow(html);
-      // Measure rendered height → explicit @page height in microns. 'auto' height is
-      // unreliable on the Star/Windows pipeline (long blank tails); measuring avoids it.
+      // Measure the rendered height (at print width) → explicit @page height in microns.
+      // 'auto' height is unreliable on the Star/Windows pipeline (long blank tails).
       let heightMicrons = 0;
       try {
+        // Measure the CONTENT height, not documentElement.scrollHeight (which returns
+        // max(content, viewport) → the 800px window height for a short receipt → a long
+        // blank tail). body's bounding box is content-height since PRINT_CSS doesn't
+        // stretch it, and it's laid out at the 302px print width.
         const px = await win.webContents.executeJavaScript('Math.ceil(document.body.getBoundingClientRect().height)');
-        heightMicrons = Math.max(1000, Math.round(Number(px) * (MICRONS_80MM / RECEIPT_PX_WIDTH)));
+        heightMicrons = Math.max(1000, Math.round(Number(px) * MICRONS_PER_PX));
       } catch { /* fall back to auto page height */ }
 
       if (smoke) {
-        // Prove the render→print pipeline headlessly. Keep options minimal — the exact
-        // 80mm sizing is a webContents.print concern (below) and needs the real printer.
         const data = await win.webContents.printToPDF({ printBackground: true });
         return { ok: true, mode: 'pdf', bytes: data.length, heightMicrons };
       }
@@ -106,12 +128,18 @@ function registerPrintHandlers(ipcMain, getMainWindow, config, log, opts = {}) {
       if (deviceName) printOpts.deviceName = deviceName;
       if (heightMicrons) printOpts.pageSize = { width: MICRONS_80MM, height: heightMicrons };
 
+      // Race the print callback against a timeout — some Windows driver failures never fire
+      // the callback, which would otherwise hang the invoke promise and leak the window.
       return await new Promise((resolve) => {
+        let settled = false;
+        const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+        const timer = setTimeout(() => { log.warn('print timeout', { deviceName }); done({ ok: false, error: 'print timeout', deviceName }); }, PRINT_TIMEOUT_MS);
         win.webContents.print(printOpts, (success, failureReason) => {
-          if (!success) log.warn('print failed', { failureReason, deviceName });
-          resolve(success
-            ? { ok: true, mode: 'print', deviceName }
-            : { ok: false, error: failureReason || 'print failed (check the Star is set as the Windows default)', deviceName });
+          clearTimeout(timer);
+          if (!success) log.warn('print failed', { failureReason, deviceName, resolvedFromFallback });
+          done(success
+            ? { ok: true, mode: 'print', deviceName, viaDefault: resolvedFromFallback }
+            : { ok: false, error: failureReason || 'print failed (is the Star set as the Windows default?)', deviceName });
         });
       });
     } catch (e) {
@@ -124,7 +152,8 @@ function registerPrintHandlers(ipcMain, getMainWindow, config, log, opts = {}) {
 
   ipcMain.handle('pos:get-status', async (event) => {
     if (!fromTrusted(event)) return { ok: false, error: 'untrusted' };
-    return { ok: true, platform: process.platform, printerName: await resolveStarPrinter(), smoke };
+    const printerName = await resolveStarPrinter();
+    return { ok: true, platform: process.platform, printerName, printerIsDefaultFallback: resolvedFromFallback, smoke };
   });
   ipcMain.handle('pos:list-printers', async (event) => {
     if (!fromTrusted(event)) return [];
@@ -141,8 +170,7 @@ function registerPrintHandlers(ipcMain, getMainWindow, config, log, opts = {}) {
     return printHtml('<div style="height:1px"></div>'); // minimal job → driver kicks the drawer
   });
 
-  // Warm the printer resolution so the first real receipt isn't slow/mis-routed.
-  resolveStarPrinter().catch(() => {});
+  resolveStarPrinter().catch(() => {}); // warm resolution so the first receipt isn't slow
 }
 
 module.exports = { registerPrintHandlers };

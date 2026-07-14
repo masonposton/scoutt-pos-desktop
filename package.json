@@ -20,7 +20,7 @@
     "artifactName": "${productName}-Setup-${version}.${ext}",
     "directories": { "output": "dist" },
     "win": {
-      "target": ["nsis"]
+      "target": [{ "target": "nsis", "arch": ["x64"] }]
     },
     "nsis": {
       "oneClick": false,

@@ -17,9 +17,14 @@ const fs = require('fs');
 const DEFAULTS = {
   appUrl: 'https://scouttpos.com',
   kiosk: true, // fullscreen kiosk (no chrome, no menu). --dev disables for local testing.
-  autoUpdate: true, // check GitHub Releases (or configured feed) for shell updates
+  // SAFE DEFAULT OFF: auto-update is a code-execution channel. It stays off until the shell
+  // is code-signed AND the release repo exists (else it's an unsigned feed pointed at a
+  // maybe-squattable repo name = RCE risk). Flip on per-counter once signed.
+  autoUpdate: false,
   printerName: '', // '' = OS default printer; set to the Star's exact name to force it
-  kickDrawerOnPrint: true, // pulse the cash drawer when a sale receipt prints
+  // Off-origin http(s) links: on a locked counter, popping the OS browser over the kiosk is
+  // a lockdown escape. Off by default in kiosk; dev keeps external links clickable.
+  openExternalLinks: false,
   allowExit: true, // enable the staff kiosk-exit shortcut (Ctrl+Shift+Q)
   preventDisplaySleep: true, // keep the counter screen awake
 };
@@ -40,6 +45,7 @@ function loadConfig() {
   if (process.argv.includes('--dev')) {
     cfg.kiosk = false;
     cfg.autoUpdate = false;
+    cfg.openExternalLinks = true; // dev: keep external links clickable
   }
   return cfg;
 }
