@@ -1,11 +1,17 @@
-# Builds + publishes the Windows installer to GitHub Releases when you push a version
-# tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`), or via the manual "Run
-# workflow" button. Runs on windows-latest — do NOT try to build the real release on
-# macOS (NSIS cross-build needs wine and can't run Windows code-signing).
+# Builds the Windows installer and publishes it to a GitHub Release when you push a
+# version tag (e.g. `git tag v0.1.2 && git push origin v0.1.2`).
 #
-# electron-updater on the installed counter app polls this repo's Releases for
-# `latest.yml` + the Setup.exe and updates the SHELL automatically. The web app itself
-# updates server-side on every reload, so shell releases are rare.
+# Why it's split into build + publish (learned the hard way on v0.1.0): electron-
+# builder's own GitHub publisher silently dropped the 100MB .exe and only uploaded the
+# tiny .blockmap. So we build with `--publish never`, then attach ALL release artifacts
+# (.exe + .blockmap + latest.yml) with softprops/action-gh-release, which is reliable for
+# large assets — and `fail_on_unmatched_files` turns a missing installer into a RED build
+# instead of a half-published release. A run-artifact backstop keeps a copy even if the
+# release step ever fails.
+#
+# electron-updater on the installed counter app reads latest.yml + the .exe from this
+# repo's Releases to self-update the SHELL. The web app updates server-side on reload, so
+# shell releases are rare.
 name: release
 
 on:
@@ -17,18 +23,31 @@ jobs:
   build-windows:
     runs-on: windows-latest
     permissions:
-      contents: write # required so GITHUB_TOKEN can create the Release
+      contents: write # so the release can be created/updated
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22 # electron 43 / node-abi want >=22.12 (node 20 warned EBADENGINE)
       - run: npm ci
-      - name: Build + publish Windows installer
-        run: npx electron-builder --win --publish always
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # When code signing is set up (Azure Trusted Signing), add:
-          # AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          # AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          # AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      - name: Build the Windows installer (no publish)
+        run: npx electron-builder --win --publish never
+      - name: Keep a copy as a run artifact (backstop)
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: |
+            dist/*.exe
+            dist/*.blockmap
+            dist/latest.yml
+          if-no-files-found: error
+      - name: Publish to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.exe
+            dist/*.blockmap
+            dist/latest.yml
+          draft: false
+          fail_on_unmatched_files: true # a missing .exe fails the build, never a half-release
