@@ -89,6 +89,35 @@ function isAppOrigin(u) {
   try { return new URL(u).origin === appOrigin; } catch { return false; }
 }
 
+// Root-caused live 2026-07-15 (a second, unrelated stuck-window bug, found via a Chromium
+// netlog capture): Clerk (the auth provider) refreshes an expired session via a real
+// top-level 307 redirect to its own subdomain (clerk.<appHost>) — a documented, non-optional
+// Clerk "handshake" flow, not something swappable for a background fetch. guardNav's
+// will-redirect guard, scoped to an EXACT origin match, silently cancelled that redirect the
+// instant Chromium received it (before any DNS lookup even started) — the kiosk was fencing
+// out its own auth provider. A browser has no such fence, which is why it always worked fine
+// there and only ever failed in the shell, and only once a stored session actually needed
+// refreshing (so it looked intermittent/network-shaped rather than what it was).
+// Fix: widen the allowlist from "exact origin" to "same site" — appHost itself or any of its
+// subdomains (clerk.<appHost>, and anything else Scoutt ever puts under its own domain).
+// Deliberately NOT a broader host-suffix check like `endsWith('scouttpos.com')` — that would
+// wrongly admit a hostile lookalike domain such as `evilscouttpos.com`; requiring an exact
+// match OR a match preceded by a literal '.' is what actually confines this to genuine
+// subdomains. Still exactly as tight a fence as before for anything outside Scoutt's own
+// domain family — an arbitrary external site is still blocked, only Scoutt's own subdomains
+// (which the kiosk already implicitly trusts, since it's loading the app FROM one of them)
+// are newly permitted.
+function isSameSite(u) {
+  try {
+    const parsed = new URL(u);
+    if (parsed.protocol !== 'https:') return false;
+    const appHost = new URL(config.appUrl).hostname;
+    return parsed.hostname === appHost || parsed.hostname.endsWith(`.${appHost}`);
+  } catch {
+    return false;
+  }
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     show: false,
@@ -111,10 +140,11 @@ function createWindow() {
 
   const wc = mainWindow.webContents;
 
-  // Navigation lock (both navigations and redirects). External http(s) links only leave
+  // Navigation lock (both navigations and redirects). Same-site (isSameSite — see its own
+  // comment) covers Scoutt's own auth-provider redirect; anything else external only leaves
   // the kiosk when openExternalLinks is on (off by default on a locked counter).
   const guardNav = (e, url) => {
-    if (isAppOrigin(url) || (SMOKE && /^(file|data):/i.test(url))) return;
+    if (isAppOrigin(url) || isSameSite(url) || (SMOKE && /^(file|data):/i.test(url))) return;
     e.preventDefault();
     if (/^https?:/i.test(url) && config.openExternalLinks) shell.openExternal(url).catch(() => {});
   };
