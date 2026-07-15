@@ -171,6 +171,14 @@ function createWindow() {
     },
   });
   mainWindow.removeMenu();
+  // Show the running shell version in the title bar at all times — asked for directly after a
+  // stretch of genuinely not knowing which build was actually running on a given machine mid-
+  // incident. The title bar is always visible now (frame:true above), so this is a permanent,
+  // glanceable answer instead of digging through main.log. The loaded web app would otherwise
+  // overwrite this with its own page title (page-title-updated fires on every navigation) —
+  // prevented below so it stays put.
+  mainWindow.setTitle(`Scoutt Pro POS — v${app.getVersion()}`);
+  mainWindow.on('page-title-updated', (e) => e.preventDefault());
   // config.kiosk now controls just this — maximize on launch so the register still fills the
   // screen — not window-chrome visibility (that's unconditional now, see the frame comment
   // above). SMOKE mode sets config.kiosk=false so automated test runs stay a small window.
