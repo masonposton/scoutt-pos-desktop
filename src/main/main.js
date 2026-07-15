@@ -122,9 +122,14 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     show: false,
     backgroundColor: '#111214',
-    kiosk: config.kiosk,
-    fullscreen: config.kiosk,
-    frame: !config.kiosk,
+    // ALWAYS a real title bar with minimize/close — owner feedback 2026-07-15: Electron's
+    // kiosk:true mode suppresses window chrome entirely, leaving no way to minimize or close
+    // without the hidden Ctrl+Shift+Q shortcut, which doesn't fit how the counter is actually
+    // used day to day. The register still fills the screen (maximized, below) — only the
+    // OS-level exclusive-fullscreen lockdown is gone. The real security boundary was never
+    // the missing title bar; it's the navigation fence (guardNav/isSameSite above) and the
+    // sandboxed webPreferences, both fully unchanged by this.
+    frame: true,
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -137,6 +142,10 @@ function createWindow() {
     },
   });
   mainWindow.removeMenu();
+  // config.kiosk now controls just this — maximize on launch so the register still fills the
+  // screen — not window-chrome visibility (that's unconditional now, see the frame comment
+  // above). SMOKE mode sets config.kiosk=false so automated test runs stay a small window.
+  if (config.kiosk) mainWindow.maximize();
 
   const wc = mainWindow.webContents;
 

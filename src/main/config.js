@@ -16,7 +16,11 @@ const fs = require('fs');
 
 const DEFAULTS = {
   appUrl: 'https://scouttpos.com',
-  kiosk: true, // fullscreen kiosk (no chrome, no menu). --dev disables for local testing.
+  // Maximize on launch so the register fills the screen. Owner feedback 2026-07-15: this used
+  // to ALSO strip the window's title bar (Electron's kiosk:true), leaving no way to minimize
+  // or close without a hidden shortcut — main.js's frame is now unconditionally true, so this
+  // field only controls the maximize. --dev disables (small window for local testing).
+  kiosk: true,
   // SAFE DEFAULT OFF: auto-update is a code-execution channel. It stays off until the shell
   // is code-signed AND the release repo exists (else it's an unsigned feed pointed at a
   // maybe-squattable repo name = RCE risk). Flip on per-counter once signed.
