@@ -21,10 +21,19 @@ const DEFAULTS = {
   // or close without a hidden shortcut — main.js's frame is now unconditionally true, so this
   // field only controls the maximize. --dev disables (small window for local testing).
   kiosk: true,
-  // SAFE DEFAULT OFF: auto-update is a code-execution channel. It stays off until the shell
-  // is code-signed AND the release repo exists (else it's an unsigned feed pointed at a
-  // maybe-squattable repo name = RCE risk). Flip on per-counter once signed.
-  autoUpdate: false,
+  // Auto-update is a code-execution channel, so it was gated OFF until two conditions were
+  // met: (a) the release repo (masonposton/scoutt-pos-desktop) actually existed under the
+  // owner's account — an unsigned feed pointed at a not-yet-existing/squattable repo name is
+  // an RCE risk — and (b) explicit owner approval. Both are now true: the repo is real, and as
+  // of 2026-07-15 it has four legitimate signed-checksum releases (v0.1.1–v0.1.4) published via
+  // the hardened CI pipeline (.github/workflows/release.yml). Owner approved flipping this on.
+  // Known remaining gap: the shell itself is still NOT Authenticode-code-signed. That mainly
+  // affects first-install Windows SmartScreen UX (an "unknown publisher" warning on the very
+  // first install), not update safety — electron-updater still verifies each downloaded update
+  // against a checksum over HTTPS, fetched from a repo only the owner can publish to. So this
+  // default being `true` is a deliberate call, not an oversight; get a cert before relying on
+  // silent SmartScreen-free installs.
+  autoUpdate: true,
   printerName: '', // '' = OS default printer; set to the Star's exact name to force it
   // Off-origin http(s) links: on a locked counter, popping the OS browser over the kiosk is
   // a lockdown escape. Off by default in kiosk; dev keeps external links clickable.

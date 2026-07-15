@@ -43,6 +43,7 @@ let offlineFallbackActive = false;
 let offlineRetryTimer = null;
 let unresponsiveTimer = null;
 let updateReady = false;
+let installingUpdate = false; // guards quitAndInstall against double-invocation (see installUpdateIfReady)
 const crashTimes = []; // in-memory renderer-crash timestamps (fast reload-storm guard)
 
 const gotLock = app.requestSingleInstanceLock();
@@ -146,6 +147,21 @@ function createWindow() {
   // screen — not window-chrome visibility (that's unconditional now, see the frame comment
   // above). SMOKE mode sets config.kiosk=false so automated test runs stay a small window.
   if (config.kiosk) mainWindow.maximize();
+
+  // Staged-update install path #2 (see installUpdateIfReady): v0.1.4 gave the window a real,
+  // discoverable title bar (frame:true, above) with a native minimize/close button. Before
+  // that, Ctrl+Shift+Q was the ONLY controlled exit, so it was the only place a staged update
+  // ever got installed. Now staff can — and normally will — close via the X button instead,
+  // which used to fall through to window-all-closed's plain app.quit() and never install a
+  // downloaded update at all. Route the normal close path through the same helper the
+  // shortcut uses so both are a "controlled staff exit" for install purposes, not just the
+  // shortcut. When no update is staged this is a complete no-op: the event is left
+  // unprevented and the window closes exactly as it always has.
+  mainWindow.on('close', (e) => {
+    if (!updateReady || installingUpdate) return; // no update pending, or already installing — normal close
+    e.preventDefault(); // hold this window open; quitAndInstall drives the real shutdown below
+    installUpdateIfReady();
+  });
 
   const wc = mainWindow.webContents;
 
@@ -293,11 +309,33 @@ function recordRelaunch() {
   try { const arr = recentRelaunches(); arr.push(Date.now()); fs.writeFileSync(relaunchLogPath(), JSON.stringify(arr)); } catch { /* ignore */ }
 }
 
+// Single funnel point for actually installing a staged update — called from two entry points
+// (the Ctrl+Shift+Q shortcut below, and the window 'close' handler in createWindow). Both are
+// "controlled staff exit" moments, as opposed to ambient OS shutdown (see autoInstallOnAppQuit
+// below). Guarded by installingUpdate so quitAndInstall is invoked exactly once even though
+// its own internal app.quit() re-fires a 'close' event on mainWindow while this is in flight —
+// without the guard that second close would see updateReady still true and loop back in here.
+// Returns true if it triggered (or is already driving) an install, false if there was nothing
+// to install (caller should fall back to its own normal-exit behavior).
+function installUpdateIfReady() {
+  if (!updateReady || installingUpdate) return installingUpdate;
+  installingUpdate = true;
+  log.info('controlled exit with update staged → quitAndInstall');
+  try {
+    autoUpdater.quitAndInstall(false, false);
+  } catch (e) {
+    log.error(e);
+    installingUpdate = false; // failed to start — let a later exit attempt retry
+    return false;
+  }
+  return true;
+}
+
 function registerKioskShortcuts() {
   if (!config.allowExit) return;
   globalShortcut.register('CommandOrControl+Shift+Q', () => {
     // If a shell update is staged, install it now (a controlled moment — not OS shutdown).
-    if (updateReady) { log.info('staff exit → quitAndInstall'); try { autoUpdater.quitAndInstall(false, false); return; } catch (e) { log.error(e); } }
+    if (installUpdateIfReady()) return;
     log.info('staff kiosk exit');
     app.quit();
   });
@@ -305,12 +343,13 @@ function registerKioskShortcuts() {
 }
 
 function setupAutoUpdate() {
-  if (!config.autoUpdate || !app.isPackaged) return; // off by default until signed + repo exists
+  if (!config.autoUpdate || !app.isPackaged) return; // off unless enabled (config.js) + packaged build
   autoUpdater.logger = log;
   autoUpdater.autoDownload = true;
   // Do NOT auto-install on ambient quit: on a kiosk that means during Windows shutdown,
-  // which can brick the app mid-write (electron-builder #7807/#3798). Install only at the
-  // controlled staff-exit chord (above).
+  // which can brick the app mid-write (electron-builder #7807/#3798). Install only at a
+  // controlled staff exit — the Ctrl+Shift+Q chord, or the normal window-close (X button) —
+  // both of which funnel through installUpdateIfReady() above.
   autoUpdater.autoInstallOnAppQuit = false;
   autoUpdater.on('error', (e) => log.warn('autoUpdater error', e));
   autoUpdater.on('update-available', (i) => log.info('update available', i?.version));
