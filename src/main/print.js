@@ -22,7 +22,9 @@ const STAR_RE = /star|tsp100|tsp143|tsp650|futureprnt/i;
 const RECEIPT_PX_WIDTH = Math.round((80 / 25.4) * 96); // ≈ 302
 const MICRONS_PER_PX = 25400 / 96; // ≈ 264.58 µm/px
 const MICRONS_80MM = 80000;
-const PRINT_TIMEOUT_MS = 30000;
+const PRINT_TIMEOUT_MS = 10000; // per attempt; the fallback ladder below tries up to 3, so
+// worst case (every attempt hangs rather than rejecting) is ~30s — matches the old single-
+// attempt budget rather than multiplying it.
 
 // Force TRUE black + an 80mm no-margin page. Design-token greys print faint on thermal.
 const PRINT_CSS = `
@@ -124,24 +126,47 @@ function registerPrintHandlers(ipcMain, getMainWindow, config, log, opts = {}) {
       }
 
       const deviceName = await resolveStarPrinter();
-      const printOpts = { silent: true, printBackground: true, margins: { marginType: 'none' } };
-      if (deviceName) printOpts.deviceName = deviceName;
-      if (heightMicrons) printOpts.pageSize = { width: MICRONS_80MM, height: heightMicrons };
+      const base = { silent: true, printBackground: true };
+      if (deviceName) base.deviceName = deviceName;
 
-      // Race the print callback against a timeout — some Windows driver failures never fire
-      // the callback, which would otherwise hang the invoke promise and leak the window.
-      return await new Promise((resolve) => {
-        let settled = false;
-        const done = (v) => { if (!settled) { settled = true; resolve(v); } };
-        const timer = setTimeout(() => { log.warn('print timeout', { deviceName }); done({ ok: false, error: 'print timeout', deviceName }); }, PRINT_TIMEOUT_MS);
-        win.webContents.print(printOpts, (success, failureReason) => {
-          clearTimeout(timer);
-          if (!success) log.warn('print failed', { failureReason, deviceName, resolvedFromFallback });
-          done(success
-            ? { ok: true, mode: 'print', deviceName, viaDefault: resolvedFromFallback }
-            : { ok: false, error: failureReason || 'print failed (is the Star set as the Windows default?)', deviceName });
+      // Fallback ladder, most-customized first. "Invalid printer settings" is a DEVMODE-
+      // validation failure from Chromium's Windows print backend — it happens before the job
+      // ever reaches the spooler, which is why it wasn't a deviceName problem (confirmed
+      // correct against Get-Printer) or a stale config override (none exists). The next most
+      // likely rejected field is the custom per-receipt page height below: many host-based/GDI
+      // receipt drivers (this Star included) only support the fixed paper sizes registered at
+      // install time, not an arbitrary custom height on every job. Try the full settings first,
+      // then progressively drop customization until one is accepted — every attempt is logged,
+      // so if none of these are it, the log still tells us exactly what Windows rejected and on
+      // which variant, instead of guessing again blind.
+      const variants = [
+        {
+          label: 'full (custom page size, no margins)',
+          opts: { ...base, margins: { marginType: 'none' }, ...(heightMicrons ? { pageSize: { width: MICRONS_80MM, height: heightMicrons } } : {}) },
+        },
+        { label: 'driver default paper size (no margins)', opts: { ...base, margins: { marginType: 'none' } } },
+        { label: 'driver defaults (no margin/page-size override)', opts: { ...base } },
+      ];
+
+      let lastFailure = null;
+      for (const { label, opts } of variants) {
+        // Race the print callback against a timeout — some Windows driver failures never fire
+        // the callback, which would otherwise hang the invoke promise and leak the window.
+        const result = await new Promise((resolve) => {
+          let settled = false;
+          const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+          const timer = setTimeout(() => done({ success: false, failureReason: 'print timeout' }), PRINT_TIMEOUT_MS);
+          win.webContents.print(opts, (success, failureReason) => {
+            clearTimeout(timer);
+            done({ success, failureReason });
+          });
         });
-      });
+        log.info('print attempt', { variant: label, opts, success: result.success, failureReason: result.failureReason });
+        if (result.success) return { ok: true, mode: 'print', deviceName, viaDefault: resolvedFromFallback, variant: label };
+        lastFailure = result.failureReason;
+      }
+      log.warn('print failed on every variant', { deviceName, resolvedFromFallback, failureReason: lastFailure });
+      return { ok: false, error: lastFailure || 'print failed (is the Star set as the Windows default?)', deviceName };
     } catch (e) {
       log.error('printHtml error', e);
       return { ok: false, error: String(e?.message || e) };
