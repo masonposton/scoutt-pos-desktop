@@ -16,19 +16,31 @@
 const { BrowserWindow } = require('electron');
 
 const STAR_RE = /star|tsp100|tsp143|tsp650|futureprnt/i;
-// Chromium's print pipeline lays out at 96 CSS px/inch. So an 80mm-wide receipt is
-// 80/25.4*96 ≈ 302 CSS px wide, and 1 CSS px = 25400/96 ≈ 264.6 microns. (The earlier
-// 380px = 80mm assumption made the declared page height ~20% short → clipped tails.)
-const RECEIPT_PX_WIDTH = Math.round((80 / 25.4) * 96); // ≈ 302
+// Root-caused live 2026-07-15, confirmed directly against the driver: Windows' own print
+// dialog for this Star shows its registered paper form as "72mm x Receipt", not 80mm — the
+// roll stock is 80mm wide, but the print head's actual addressable/printable width (what the
+// driver registers with Windows) is 72mm, same margin-vs-roll-width gap as most thermal
+// receipt printers. Every silent-print attempt was building a DEVMODE at 80mm, a width this
+// driver has no registered form for — which is exactly the "Invalid printer settings" failure
+// (rejected before the job ever reaches the spooler) that every fallback-ladder variant hit,
+// since only the WIDTH was ever wrong, not the margins or omitting a custom size entirely.
+// Chromium's print pipeline lays out at 96 CSS px/inch. So a 72mm-wide receipt is
+// 72/25.4*96 ≈ 272 CSS px wide, and 1 CSS px = 25400/96 ≈ 264.6 microns. Render width and the
+// native pageSize width MUST match — printing a page rendered at one width onto a driver form
+// of a different width means Chromium either clips or rescales the content, so this constant
+// drives both (RECEIPT_PX_WIDTH and PRINT_CSS's @page below, plus MICRONS_RECEIPT_WIDTH used
+// as the native pageSize.width in printHtml).
+const RECEIPT_PX_WIDTH = Math.round((72 / 25.4) * 96); // ≈ 272
 const MICRONS_PER_PX = 25400 / 96; // ≈ 264.58 µm/px
-const MICRONS_80MM = 80000;
+const MICRONS_RECEIPT_WIDTH = 72000;
 const PRINT_TIMEOUT_MS = 10000; // per attempt; the fallback ladder below tries up to 3, so
 // worst case (every attempt hangs rather than rejecting) is ~30s — matches the old single-
 // attempt budget rather than multiplying it.
 
-// Force TRUE black + an 80mm no-margin page. Design-token greys print faint on thermal.
+// Force TRUE black + a 72mm no-margin page (this driver's actual registered printable width —
+// see RECEIPT_PX_WIDTH above). Design-token greys print faint on thermal.
 const PRINT_CSS = `
-  @page { size: 80mm auto; margin: 0; }
+  @page { size: 72mm auto; margin: 0; }
   html, body { margin: 0 !important; padding: 0 !important; background: #fff !important; }
   * { color: #000 !important; border-color: #000 !important;
       -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
@@ -142,7 +154,7 @@ function registerPrintHandlers(ipcMain, getMainWindow, config, log, opts = {}) {
       const variants = [
         {
           label: 'full (custom page size, no margins)',
-          opts: { ...base, margins: { marginType: 'none' }, ...(heightMicrons ? { pageSize: { width: MICRONS_80MM, height: heightMicrons } } : {}) },
+          opts: { ...base, margins: { marginType: 'none' }, ...(heightMicrons ? { pageSize: { width: MICRONS_RECEIPT_WIDTH, height: heightMicrons } } : {}) },
         },
         { label: 'driver default paper size (no margins)', opts: { ...base, margins: { marginType: 'none' } } },
         { label: 'driver defaults (no margin/page-size override)', opts: { ...base } },
