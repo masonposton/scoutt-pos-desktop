@@ -1,7 +1,7 @@
 {
   "name": "scoutt-pos-desktop",
   "productName": "Scoutt Pro POS",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Scoutt Pro POS — Windows kiosk desktop shell for scouttpos.com with native receipt printing, cash-drawer kick, and auto-update.",
   "main": "src/main/main.js",
   "author": "Scoutt",

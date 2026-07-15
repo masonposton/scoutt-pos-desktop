@@ -44,7 +44,34 @@ let offlineRetryTimer = null;
 let unresponsiveTimer = null;
 let updateReady = false;
 let installingUpdate = false; // guards quitAndInstall against double-invocation (see installUpdateIfReady)
+let updateCheckStarted = false; // guards setupAutoUpdate against double-invocation (see did-finish-load)
 const crashTimes = []; // in-memory renderer-crash timestamps (fast reload-storm guard)
+
+// Global safety net for the MAIN process itself. render-process-gone (below) already recovers
+// from a crashed/hung RENDERER, but nothing previously caught an exception thrown in the
+// shell's OWN code (main.js/print.js) — Node's default response to an uncaught main-process
+// exception is to exit immediately: no window, no dialog, and — since it's a clean JS exit, not
+// a native crash — nothing in Windows' own Application event log either. A silently dead
+// register with zero trace. This reuses the SAME persisted relaunch backoff as the renderer
+// path (recentRelaunches/recordRelaunch/showFatalPage, defined further down — safe to reference
+// here ahead of their declarations, since `function` declarations are hoisted and this handler
+// only actually runs later, never during registration) so a deterministic exception that would
+// refire immediately on relaunch can't spin forever; it lands on the same "needs attention"
+// fatal page the crash-storm path already uses instead.
+function handleFatalMainError(kind, err) {
+  log.error(`main process ${kind}`, err);
+  if (recentRelaunches().length >= 2) {
+    log.error('relaunch storm (main process) → fatal page');
+    showFatalPage();
+    return;
+  }
+  recordRelaunch();
+  log.error(`${kind} → clean relaunch`);
+  app.relaunch();
+  app.exit(0);
+}
+process.on('uncaughtException', (err) => handleFatalMainError('uncaughtException', err));
+process.on('unhandledRejection', (reason) => handleFatalMainError('unhandledRejection', reason));
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -70,7 +97,8 @@ if (!gotLock) {
     registerPrintHandlers(ipcMain, () => mainWindow, config, log, { smoke: SMOKE });
     if (SMOKE) registerSmokeExit();
     registerKioskShortcuts();
-    setupAutoUpdate();
+    // setupAutoUpdate() is deliberately NOT called here — see did-finish-load in createWindow()
+    // below, which defers it until the real app has actually finished loading.
 
     app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
   });
@@ -230,6 +258,13 @@ function createWindow() {
     if (isAppOrigin(wc.getURL())) {
       offlineFallbackActive = false;
       if (offlineRetryTimer) { clearInterval(offlineRetryTimer); offlineRetryTimer = null; }
+      // Start the update check only once the real app has actually finished loading, not
+      // alongside it. Root-caused live 2026-07-15: on a flaky (not fully down) connection, the
+      // updater's own download traffic — kicked off in parallel with the page load before this
+      // change — competes for bandwidth against the page load it's racing, which can tip a
+      // borderline load into the 15s "nothing painted" timeout below. updateCheckStarted keeps
+      // this to exactly once per app lifetime (did-finish-load can fire again on reconnects).
+      if (!updateCheckStarted) { updateCheckStarted = true; setupAutoUpdate(); }
     }
   });
 
@@ -273,8 +308,11 @@ function showOfflineSplash() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   offlineFallbackActive = true;
   // Always (re)show the splash — covers a failed retry that would otherwise leave a raw
-  // Chromium error page on screen.
-  mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'offline.html')).catch(() => {});
+  // Chromium error page on screen. This load failing was previously swallowed silently; log it
+  // — the retry timer below still self-heals once the app is reachable either way, but a
+  // failure to even paint the splash itself was invisible in the log until now.
+  mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'offline.html'))
+    .catch((e) => log.warn('offline splash load failed', e));
   if (!offlineRetryTimer) offlineRetryTimer = setInterval(pollReconnect, 5000);
 }
 
