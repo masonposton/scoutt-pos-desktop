@@ -26,6 +26,16 @@ log.transports.file.level = 'info';
 
 const SMOKE = process.argv.includes('--smoke');
 
+// Force IPv4-only DNS/connect. Root-caused 2026-07-15: a counter machine tethered to a
+// phone hotspot had a dead/blackholed IPv6 default route (common on mobile hotspots — the
+// interface advertises IPv6 but doesn't actually forward it). A full browser's network stack
+// races IPv4/IPv6 (Happy Eyeballs) and silently falls back within ~250ms; this app's loadURL
+// committed to the dead IPv6 attempt, timed out, and — because it's a kiosk window that never
+// painted anything — left the counter staring at nothing with no error and no way to tell.
+// This app never needs IPv6 (it only ever talks to scouttpos.com), so skip the class of
+// failure entirely rather than depend on getting Happy-Eyeballs-equivalent timing right.
+app.commandLine.appendSwitch('disable-ipv6');
+
 let mainWindow = null;
 let config = null;
 let appOrigin = null;
@@ -168,8 +178,34 @@ function createWindow() {
     }
   });
 
-  mainWindow.once('ready-to-show', () => mainWindow.show());
+  // contentShown tracks whether REAL content has ever painted — set only inside
+  // ready-to-show, Electron's own compositor-first-paint signal. Deliberately NOT
+  // BrowserWindow.isVisible(): verified by direct test (2026-07-15) that on macOS,
+  // kiosk+fullscreen windows fire the native OS 'show' event and report isVisible()===true
+  // on their own, as part of entering the fullscreen Space, even with show:false and even
+  // with NOTHING ever loaded — isVisible() cannot tell "an empty black rect is on screen"
+  // from "the app actually painted." ready-to-show is unaffected by that OS-level quirk
+  // (confirmed by the same test: it correctly never fires when nothing loads) — it's
+  // Electron's own render-readiness signal, not the native window-manager visibility flag.
+  let contentShown = false;
+  mainWindow.once('ready-to-show', () => { contentShown = true; mainWindow.show(); });
   loadApp();
+
+  // Visibility backstop: guarantee the window is never invisible-with-no-content forever,
+  // regardless of WHY the initial load never resolves (the IPv6-blackhole case above is now
+  // prevented at the source, but this is defense-in-depth against any other unforeseen hang —
+  // a stalled DNS resolution, a captive portal, a proxy that neither succeeds nor errors). If
+  // nothing has painted within 15s of starting the load, force the offline splash — which is
+  // exactly the right state to land in: it explains what's wrong and self-heals the moment the
+  // app becomes reachable (see did-fail-load's comment above). The contentShown flag makes
+  // this idempotent: a normal fast load, or an earlier did-fail-load that already painted the
+  // splash, both set it before 15s, so this simply no-ops.
+  setTimeout(() => {
+    if (mainWindow && !mainWindow.isDestroyed() && !contentShown) {
+      log.error('nothing painted 15s after load start — forcing offline splash');
+      showOfflineSplash();
+    }
+  }, 15000);
 }
 
 function loadApp() {
