@@ -13,7 +13,9 @@
 // smoke mode every "print" goes to printToPDF instead, so the render pipeline is
 // provable headlessly on a Mac with no physical printer.
 
-const { BrowserWindow } = require('electron');
+const { BrowserWindow, app } = require('electron');
+const path = require('path');
+const fs = require('fs');
 
 const STAR_RE = /star|tsp100|tsp143|tsp650|futureprnt/i;
 // Root-caused live 2026-07-15, confirmed directly against the driver: Windows' own print
@@ -80,6 +82,43 @@ async function renderReceiptWindow(html) {
   return win;
 }
 
+// PDF-based silent print: bypasses Chromium's Windows print backend entirely while keeping
+// the Star Windows DRIVER in the path (mandatory on this hardware — see the header comment:
+// raster-only, no ESC/POS interpreter, and the cash-drawer kick is a driver setting). The
+// rendered receipt window is exported to a correctly-sized PDF (printToPDF's headless
+// pipeline — which provably works on this codebase; it's exactly what smoke mode exercises),
+// written to a temp file, and handed to the driver by SumatraPDF (bundled inside the
+// pdf-to-printer package; asarUnpack'd in package.json so the .exe is spawnable from disk).
+// 'noscale' keeps the 72mm-wide page 1:1 on the driver's 72mm form instead of letting
+// anything rescale it. NOTE printToPDF's pageSize is in INCHES, unlike print()'s microns.
+const PDF_PRINT_TIMEOUT_MS = 20000;
+async function printViaPdf(win, deviceName, heightMicrons) {
+  let tmpPath = null;
+  try {
+    const data = await win.webContents.printToPDF({
+      printBackground: true,
+      // Height floor of 1 inch: Chromium rejects sub-inch paper sizes, and the drawer-kick
+      // job (a 1px div → ~1mm measured height) would otherwise hit exactly that.
+      pageSize: { width: 72 / 25.4, height: Math.max(heightMicrons || 0, 25400) / 25400 },
+      margins: { top: 0, bottom: 0, left: 0, right: 0 },
+    });
+    tmpPath = path.join(app.getPath('temp'), `scoutt-receipt-${process.pid}-${Date.now()}.pdf`);
+    fs.writeFileSync(tmpPath, data);
+    // Lazy require: Windows-only package (ships a bundled .exe) — never loaded on the
+    // Mac dev/smoke path, which returns above before any native printing is attempted.
+    const { print } = require('pdf-to-printer');
+    await Promise.race([
+      print(tmpPath, { printer: deviceName, scale: 'noscale', silent: true }),
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error('pdf print timeout')), PDF_PRINT_TIMEOUT_MS)),
+    ]);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  } finally {
+    if (tmpPath) fs.unlink(tmpPath, () => { /* best-effort temp cleanup */ });
+  }
+}
+
 function registerPrintHandlers(ipcMain, getMainWindow, config, log, opts = {}) {
   const smoke = !!opts.smoke;
   let appOrigin = null;
@@ -127,7 +166,7 @@ function registerPrintHandlers(ipcMain, getMainWindow, config, log, opts = {}) {
         // Measure the CONTENT height, not documentElement.scrollHeight (which returns
         // max(content, viewport) → the 800px window height for a short receipt → a long
         // blank tail). body's bounding box is content-height since PRINT_CSS doesn't
-        // stretch it, and it's laid out at the 302px print width.
+        // stretch it, and it's laid out at RECEIPT_PX_WIDTH (the 72mm print width).
         const px = await win.webContents.executeJavaScript('Math.ceil(document.body.getBoundingClientRect().height)');
         heightMicrons = Math.max(1000, Math.round(Number(px) * MICRONS_PER_PX));
       } catch { /* fall back to auto page height */ }
@@ -141,16 +180,15 @@ function registerPrintHandlers(ipcMain, getMainWindow, config, log, opts = {}) {
       const base = { silent: true, printBackground: true };
       if (deviceName) base.deviceName = deviceName;
 
-      // Fallback ladder, most-customized first. "Invalid printer settings" is a DEVMODE-
-      // validation failure from Chromium's Windows print backend — it happens before the job
-      // ever reaches the spooler, which is why it wasn't a deviceName problem (confirmed
-      // correct against Get-Printer) or a stale config override (none exists). The next most
-      // likely rejected field is the custom per-receipt page height below: many host-based/GDI
-      // receipt drivers (this Star included) only support the fixed paper sizes registered at
-      // install time, not an arbitrary custom height on every job. Try the full settings first,
-      // then progressively drop customization until one is accepted — every attempt is logged,
-      // so if none of these are it, the log still tells us exactly what Windows rejected and on
-      // which variant, instead of guessing again blind.
+      // Fallback ladder, most-customized first. "Invalid printer settings" is a settings-
+      // negotiation failure from Chromium's Windows print backend — it happens before the job
+      // ever reaches the spooler. Live v0.1.8 evidence: on the counter's Star TSP100 every one
+      // of these variants fails identically (deviceName verified exact against Get-Printer, no
+      // config override, correct 72mm width), so on THAT driver the whole webContents.print()
+      // path is a dead end and rung 5 (printViaPdf) is what actually lands the job. The ladder
+      // stays: on ordinary printers (HP/Epson at the office) silent print works fine and rung
+      // 1-3 succeeds without ever touching SumatraPDF, and each attempt is logged for the next
+      // time a driver misbehaves.
       const variants = [
         {
           label: 'full (custom page size, no margins)',
@@ -159,6 +197,20 @@ function registerPrintHandlers(ipcMain, getMainWindow, config, log, opts = {}) {
         { label: 'driver default paper size (no margins)', opts: { ...base, margins: { marginType: 'none' } } },
         { label: 'driver defaults (no margin/page-size override)', opts: { ...base } },
       ];
+
+      // Rung 4: no deviceName at all. Chromium resolves the DEFAULT printer through a
+      // different backend path (default-settings lookup) than an explicitly named one
+      // (per-printer settings negotiation) — there are real cases where the named path
+      // fails and the default path works on the same driver. Only safe when the Star IS
+      // the Windows default (it is on the counter machine — owner confirmed) — otherwise
+      // this would silently print the receipt to some other device, so gate it hard.
+      try {
+        const printers = await listPrinters();
+        const def = printers.find((p) => p.isDefault);
+        if (def && def.name === deviceName) {
+          variants.push({ label: 'default printer (no deviceName)', opts: { silent: true, printBackground: true } });
+        }
+      } catch { /* enumeration failed — skip this rung */ }
 
       let lastFailure = null;
       for (const { label, opts } of variants) {
@@ -177,6 +229,19 @@ function registerPrintHandlers(ipcMain, getMainWindow, config, log, opts = {}) {
         if (result.success) return { ok: true, mode: 'print', deviceName, viaDefault: resolvedFromFallback, variant: label };
         lastFailure = result.failureReason;
       }
+      // Rung 5 — the real bypass. Root-caused 2026-07-15 from live v0.1.8 ladder output: EVERY
+      // webContents.print() variant above fails with 'Invalid printer settings' before the job
+      // ever reaches the spooler — including bare driver defaults with nothing but the printer
+      // name — so the incompatibility is Chromium's print-settings negotiation with this Star
+      // driver itself, not any specific option we pass. Skip that negotiation entirely:
+      // render to PDF and print through the same driver via SumatraPDF (printViaPdf above).
+      if (process.platform === 'win32' && deviceName) {
+        const r = await printViaPdf(win, deviceName, heightMicrons);
+        log.info('print attempt', { variant: 'pdf → SumatraPDF → driver', success: r.ok, failureReason: r.error });
+        if (r.ok) return { ok: true, mode: 'pdf-native', deviceName, viaDefault: resolvedFromFallback, variant: 'pdf-native' };
+        lastFailure = r.error || lastFailure;
+      }
+
       log.warn('print failed on every variant', { deviceName, resolvedFromFallback, failureReason: lastFailure });
       return { ok: false, error: lastFailure || 'print failed (is the Star set as the Windows default?)', deviceName };
     } catch (e) {

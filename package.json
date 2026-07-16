@@ -1,7 +1,7 @@
 {
   "name": "scoutt-pos-desktop",
   "productName": "Scoutt Pro POS",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Scoutt Pro POS — Windows kiosk desktop shell for scouttpos.com with native receipt printing, cash-drawer kick, and auto-update.",
   "main": "src/main/main.js",
   "author": "Scoutt",
@@ -18,9 +18,21 @@
     "appId": "com.scoutt.pos",
     "productName": "Scoutt Pro POS",
     "artifactName": "Scoutt-Pro-POS-Setup-${version}.${ext}",
-    "directories": { "output": "dist" },
+    "directories": {
+      "output": "dist"
+    },
+    "asarUnpack": [
+      "**/node_modules/pdf-to-printer/**"
+    ],
     "win": {
-      "target": [{ "target": "nsis", "arch": ["x64"] }]
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
     },
     "nsis": {
       "oneClick": false,
@@ -35,7 +47,11 @@
       "differentialPackage": true
     },
     "publish": [
-      { "provider": "github", "owner": "masonposton", "repo": "scoutt-pos-desktop" }
+      {
+        "provider": "github",
+        "owner": "masonposton",
+        "repo": "scoutt-pos-desktop"
+      }
     ]
   },
   "devDependencies": {
@@ -44,6 +60,7 @@
   },
   "dependencies": {
     "electron-log": "^5.4.4",
-    "electron-updater": "^6.8.9"
+    "electron-updater": "^6.8.9",
+    "pdf-to-printer": "^5.8.0"
   }
 }
